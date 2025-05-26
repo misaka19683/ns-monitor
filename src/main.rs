@@ -1,17 +1,14 @@
 use std::net::Ipv6Addr;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::HashSet;
 use std::os::fd::AsRawFd;
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-mod bpf;
 mod ndp;
 mod ping;
 mod interface;
@@ -63,15 +60,16 @@ async fn main() -> Result<()> {
 
     info!("Starting outbound NS monitor on {} and forwarding to {:?}", args.master, args.slaves);
 
-    // Get interface local addresses for source filtering
-    let local_addrs = interface::get_interface_addresses(&args.master)?;
-    info!("Local addresses on {}: {:?}", args.master, local_addrs);
+    // Get master interface MAC address for source filtering
+    let master_mac = interface::get_interface_mac(&args.master)?;
+    info!("Master interface MAC address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", 
+          master_mac[0], master_mac[1], master_mac[2], master_mac[3], master_mac[4], master_mac[5]);
 
     // Create shared state
     let state = Arc::new(Mutex::new(AppState {
         master: args.master.clone(),
         slaves: args.slaves.clone(),
-        local_addrs,
+        master_mac,
         ns_counter: 0,
         ping_counter: 0,
     }));
@@ -87,28 +85,34 @@ async fn main() -> Result<()> {
 struct AppState {
     master: String,
     slaves: Vec<String>,
-    local_addrs: HashSet<Ipv6Addr>,
+    master_mac: [u8; 6],
     ns_counter: u64,
     ping_counter: u64,
 }
 
 fn validate_interface(interface: &str) -> Result<()> {
-    let output = Command::new("ip")
-        .args(["link", "show", interface])
-        .output()
-        .context("Failed to execute ip command")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Interface {} does not exist", interface);
+    // Use nix to check if the interface exists by name
+    match nix::net::if_::if_nametoindex(interface) {
+        Ok(_) => Ok(()),
+        Err(_) => anyhow::bail!("Interface {} does not exist", interface),
     }
+}
 
-    Ok(())
+/// 生成仅允许 ICMPv6 Neighbor Solicitation 的 BPF 字节码数组
+fn create_ns_filter() -> Vec<libc::sock_filter> {
+    vec![
+        libc::sock_filter { code: 0x30, jt: 0, jf: 0, k: 6 },
+        libc::sock_filter { code: 0x15, jt: 0, jf: 5, k: 58 },
+        libc::sock_filter { code: 0x30, jt: 0, jf: 0, k: 40 },
+        libc::sock_filter { code: 0x15, jt: 0, jf: 3, k: 135 },
+        libc::sock_filter { code: 0x6, jt: 0, jf: 0, k: 0xffff_ffff },
+        libc::sock_filter { code: 0x6, jt: 0, jf: 0, k: 0 },
+    ]
 }
 
 fn setup_ns_monitor_socket(interface: &str) -> Result<Socket> {
-    // Create raw ICMPv6 socket
-    let socket = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))
-        .context("Failed to create raw socket")?;
+    // Create packet socket to capture ethernet frames
+    let socket = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(libc::ETH_P_IPV6)))?;
 
     // Set socket options
     socket.set_nonblocking(true)?;
@@ -117,33 +121,22 @@ fn setup_ns_monitor_socket(interface: &str) -> Result<Socket> {
     let if_index = nix::net::if_::if_nametoindex(interface)
         .context("Failed to get interface index")?;
 
-    socket.bind_device(Some(interface.as_bytes()))?;
-
-    // Apply BPF filter for NS packets only
-    let filter = bpf::create_ns_filter();
-    socket.attach_filter(&filter)?;
-
-
-    // Join all-nodes multicast group (ff02::1) to receive NS packets
-    let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
-    join_multicast_group(&socket, &all_nodes, if_index as u32)?;
-
-    Ok(socket)
-}
-
-fn join_multicast_group(socket: &Socket, addr: &Ipv6Addr, if_index: u32) -> Result<()> {
-    let mreq = libc::ipv6_mreq {
-        ipv6mr_multiaddr: ipv6_addr_to_libc(addr),
-        ipv6mr_interface: if_index,
+    // Bind to interface
+    let sll = libc::sockaddr_ll {
+        sll_family: libc::AF_PACKET as u16,
+        sll_protocol: (libc::ETH_P_IPV6 as u16).to_be(),
+        sll_ifindex: if_index as i32,
+        sll_hatype: 0,
+        sll_pkttype: 0,
+        sll_halen: 0,
+        sll_addr: [0; 8],
     };
 
     unsafe {
-        let ret = libc::setsockopt(
+        let ret = libc::bind(
             socket.as_raw_fd(),
-            libc::IPPROTO_IPV6,
-            libc::IPV6_ADD_MEMBERSHIP,
-            &mreq as *const _ as *const libc::c_void,
-            size_of::<libc::ipv6_mreq>() as libc::socklen_t,
+            &sll as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
         );
 
         if ret < 0 {
@@ -151,52 +144,76 @@ fn join_multicast_group(socket: &Socket, addr: &Ipv6Addr, if_index: u32) -> Resu
         }
     }
 
-    Ok(())
-}
-
-fn ipv6_addr_to_libc(addr: &Ipv6Addr) -> libc::in6_addr {
-    let segments = addr.segments();
-    let mut bytes = [0u8; 16];
-
-    for i in 0..8 {
-        bytes[i*2] = (segments[i] >> 8) as u8;
-        bytes[i*2+1] = segments[i] as u8;
-    }
-
-    libc::in6_addr { s6_addr: bytes }
+    // Apply BPF filter for NS packets only
+    let filter = create_ns_filter();
+    socket.attach_filter(&filter)?;
+    
+    Ok(socket)
 }
 
 async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Result<()> {
-    // Convert to tokio socket
-    let socket = tokio::net::UdpSocket::from_std(socket.into())
-        .context("Failed to convert socket to tokio socket")?;
-
-    // Buffer for receiving packets
+    // 使用AsyncFd包装原始套接字，而不是转换为UdpSocket
+    let async_fd = tokio::io::unix::AsyncFd::new(socket)?;
+    
+    // 接收缓冲区
     let mut buf = [0u8; 1500];
-
+    
     loop {
-        // Receive packet
-        match socket.recv_from(&mut buf).await {
-            Ok((len, addr)) => {
-                debug!("Received {} bytes from {}", len, addr);
-
-                // Parse NS packet and check if it's from our local address
-                if let Some((source, target)) = ndp::parse_ns_packet_with_source(&buf[..len]) {
+        // 等待套接字可读
+        let mut guard = async_fd.readable().await?;
+        
+        // 尝试读取数据包
+        match guard.try_io(|inner| {
+            let fd = inner.get_ref().as_raw_fd();
+            let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            
+            let len = unsafe {
+                libc::recvfrom(
+                    fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                    &mut addr as *mut _ as *mut libc::sockaddr,
+                    &mut addr_len,
+                )
+            };
+            
+            if len < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            
+            Ok(len as usize)
+        }) {
+            Ok(Ok(len)) => {
+                debug!("Received {} bytes", len);
+                
+                // 解析包含以太网头部的NS数据包
+                if let Some((source_mac, target)) = ndp::parse_ethernet_ns_packet(&buf[..len]) {
                     let state_guard = state.lock().await;
-
-                    // Only process packets from our local addresses
-                    if state_guard.local_addrs.contains(&source) {
-                        debug!("Outgoing NS packet from {} to {}", source, target);
-                        drop(state_guard); // Release lock before async call
+                    
+                    // 比较源MAC地址与master接口的MAC地址
+                    if source_mac == state_guard.master_mac {
+                        debug!("Outgoing NS packet from our MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} for target {}",
+                               source_mac[0], source_mac[1], source_mac[2], 
+                               source_mac[3], source_mac[4], source_mac[5], target);
+                        
+                        drop(state_guard); // 在异步调用前释放锁
                         handle_ns_packet(&target, state.clone()).await?;
                     } else {
-                        debug!("Ignoring NS packet from non-local address: {}", source);
+                        debug!("Ignoring NS packet from MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                               source_mac[0], source_mac[1], source_mac[2], 
+                               source_mac[3], source_mac[4], source_mac[5]);
                     }
                 }
-            }
-            Err(e) => {
+            },
+            Ok(Err(e)) => {
                 error!("Error receiving packet: {}", e);
                 sleep(Duration::from_millis(100)).await;
+            },
+            Err(_would_block) => {
+                // 套接字暂时不可读，继续等待
+                continue;
             }
         }
     }
