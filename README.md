@@ -36,13 +36,12 @@ sudo cp target/release/ns-monitor /usr/local/bin/
 ### 依赖项
 
 - Rust 1.56.0+
-- libpcap-dev
 - libc6-dev
 
 在Debian/Ubuntu系统上安装依赖：
 
 ```bash
-sudo apt install libpcap-dev libc6-dev
+sudo apt install libc6-dev
 ```
 
 ## 使用方法

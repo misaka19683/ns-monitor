@@ -4,10 +4,11 @@ use std::time::Duration;
 use std::os::fd::AsRawFd;
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use tokio::signal;
 
 mod ndp;
 mod ping;
@@ -15,7 +16,8 @@ mod interface;
 
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about = "NS monitor and ping6 forwarder")]
+#[clap(author, version, about = "IPv6 Neighbor Solicitation monitor and ping6 forwarder")]
+#[clap(long_about = "NS-Monitor listens for outgoing IPv6 Neighbor Solicitation packets on a master interface and forwards ping6 requests to configured slave interfaces to help with IPv6 neighbor discovery across multiple network interfaces.")]
 struct Args {
     /// Master interface to monitor for outgoing NS packets
     #[clap(short, long)]
@@ -67,7 +69,6 @@ async fn main() -> Result<()> {
 
     // Create shared state
     let state = Arc::new(Mutex::new(AppState {
-        master: args.master.clone(),
         slaves: args.slaves.clone(),
         master_mac,
         ns_counter: 0,
@@ -78,12 +79,19 @@ async fn main() -> Result<()> {
     let socket = setup_ns_monitor_socket(&args.master)
         .context("Failed to setup NS monitor socket")?;
 
-    // Start the main monitoring loop
-    monitor_ns_packets(socket, state).await
+    // Start the main monitoring loop with signal handling
+    tokio::select! {
+        result = monitor_ns_packets(socket, state) => {
+            result
+        }
+        _ = signal::ctrl_c() => {
+            info!("Received SIGINT, shutting down gracefully");
+            Ok(())
+        }
+    }
 }
 
 struct AppState {
-    master: String,
     slaves: Vec<String>,
     master_mac: [u8; 6],
     ns_counter: u64,
@@ -98,39 +106,61 @@ fn validate_interface(interface: &str) -> Result<()> {
     }
 }
 
-/// 生成仅允许 ICMPv6 Neighbor Solicitation 的 BPF 字节码数组
+/// Generate BPF bytecode array that only allows ICMPv6 packets
+/// Using a simpler filter that just checks for ICMPv6 protocol
 fn create_ns_filter() -> Vec<libc::sock_filter> {
     vec![
-        libc::sock_filter { code: 0x30, jt: 0, jf: 0, k: 6 },
-        libc::sock_filter { code: 0x15, jt: 0, jf: 5, k: 58 },
-        libc::sock_filter { code: 0x30, jt: 0, jf: 0, k: 40 },
-        libc::sock_filter { code: 0x15, jt: 0, jf: 3, k: 135 },
-        libc::sock_filter { code: 0x6, jt: 0, jf: 0, k: 0xffff_ffff },
-        libc::sock_filter { code: 0x6, jt: 0, jf: 0, k: 0 },
+        // Load packet length
+        libc::sock_filter { code: 0x80, jt: 0, jf: 0, k: 0 },       // BPF_LD + BPF_W + BPF_LEN
+        // Check if packet is large enough (at least 54 bytes for Eth+IPv6+ICMPv6)
+        libc::sock_filter { code: 0x35, jt: 0, jf: 4, k: 54 },      // BPF_JMP + BPF_JGE + BPF_K
+        // Load Ethernet Type field (2 bytes at offset 12)
+        libc::sock_filter { code: 0x28, jt: 0, jf: 0, k: 12 },      // BPF_LD + BPF_H + BPF_ABS
+        // Jump if not IPv6 (0x86dd)
+        libc::sock_filter { code: 0x15, jt: 0, jf: 2, k: 0x86dd },  // BPF_JMP + BPF_JEQ + BPF_K
+        // Load IPv6 Next Header field (1 byte at offset 20)
+        libc::sock_filter { code: 0x30, jt: 0, jf: 0, k: 20 },      // BPF_LD + BPF_B + BPF_ABS
+        // Jump if ICMPv6 (58)
+        libc::sock_filter { code: 0x15, jt: 1, jf: 0, k: 58 },      // BPF_JMP + BPF_JEQ + BPF_K
+        // Reject packet
+        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: 0 },       // BPF_RET + BPF_K
+        // Accept packet
+        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: 0xffff },  // BPF_RET + BPF_K
     ]
 }
 
 fn setup_ns_monitor_socket(interface: &str) -> Result<Socket> {
-    // Create packet socket to capture ethernet frames
-    let socket = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(libc::ETH_P_IPV6)))?;
+    debug!("Creating packet socket for interface: {}", interface);
+    
+    // Create packet socket to capture ALL ethernet frames (not just IPv6) to see outgoing packets
+    let socket = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(libc::ETH_P_ALL)))
+        .context("Failed to create packet socket")?;
+    debug!("Successfully created packet socket");
 
     // Set socket options
-    socket.set_nonblocking(true)?;
+    socket.set_nonblocking(true)
+        .context("Failed to set socket non-blocking")?;
+    debug!("Set socket to non-blocking mode");
 
     // Bind to the interface
     let if_index = nix::net::if_::if_nametoindex(interface)
         .context("Failed to get interface index")?;
+    debug!("Interface {} has index: {}", interface, if_index);
 
-    // Bind to interface
+    // Bind to interface - use ETH_P_ALL to catch all packets including outgoing
     let sll = libc::sockaddr_ll {
         sll_family: libc::AF_PACKET as u16,
-        sll_protocol: (libc::ETH_P_IPV6 as u16).to_be(),
+        sll_protocol: (libc::ETH_P_ALL as u16).to_be(),
         sll_ifindex: if_index as i32,
         sll_hatype: 0,
-        sll_pkttype: 0,
+        sll_pkttype: 0,  // Accept all packet types (incoming and outgoing)
         sll_halen: 0,
         sll_addr: [0; 8],
     };
+    
+    debug!("Binding socket to interface {} (index: {})", interface, if_index);
+    debug!("sockaddr_ll: family={}, protocol={}, ifindex={}", 
+           sll.sll_family, u16::from_be(sll.sll_protocol), sll.sll_ifindex);
 
     unsafe {
         let ret = libc::bind(
@@ -140,33 +170,60 @@ fn setup_ns_monitor_socket(interface: &str) -> Result<Socket> {
         );
 
         if ret < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            error!("Failed to bind socket to interface {}: {}", interface, error);
+            return Err(error.into());
         }
     }
+    debug!("Successfully bound socket to interface {}", interface);
 
-    // Apply BPF filter for NS packets only
+    // Apply BPF filter for NS packets only using manual setsockopt
+    debug!("Creating BPF filter for NS packets");
     let filter = create_ns_filter();
-    socket.attach_filter(&filter)?;
+    debug!("BPF filter created with {} instructions", filter.len());
+    
+    let filter_prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut libc::sock_filter,
+    };
+    
+    debug!("Applying BPF filter to socket");
+    unsafe {
+        let ret = libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            &filter_prog as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            let error = std::io::Error::last_os_error();
+            error!("Failed to attach BPF filter: {}", error);
+            return Err(error.into());
+        }
+    }
+    debug!("Successfully applied BPF filter");
     
     Ok(socket)
 }
 
 async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Result<()> {
-    // 使用AsyncFd包装原始套接字
+    // Use AsyncFd to wrap the raw socket
     let async_fd = tokio::io::unix::AsyncFd::new(socket)?;
     
-    // 接收缓冲区
-    let mut buf = [0u8; 1500];
+    // Receive buffer - use standard Ethernet MTU size
+    const MAX_PACKET_SIZE: usize = 1500;
+    let mut buf = [0u8; MAX_PACKET_SIZE];
     
     loop {
-        // 等待套接字可读
+        // Wait for socket to become readable
         let mut guard = async_fd.readable().await?;
         
-        // 尝试读取数据包
+        // Try to read packet data
         match guard.try_io(|inner| {
             let fd = inner.get_ref().as_raw_fd();
-            let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            let mut addr_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
             
             let len = unsafe {
                 libc::recvfrom(
@@ -183,36 +240,66 @@ async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Resu
                 return Err(std::io::Error::last_os_error());
             }
             
-            Ok(len as usize)
+            // Validate packet size
+            if len > MAX_PACKET_SIZE as isize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData, 
+                    format!("Packet too large: {} bytes", len)
+                ));
+            }
+            
+            Ok((len as usize, addr))
         }) {
-            Ok(Ok(len)) => {
-                debug!("Received {} bytes", len);
+            Ok(Ok((len, addr))) => {
+                // Check packet type - we're specifically looking for outgoing packets
+                let packet_type = addr.sll_pkttype;
+                debug!("Received {} bytes, packet type: {}", len, packet_type);
                 
-                // 解析包含以太网头部的NS数据包
-                if let Some((source_mac, target)) = ndp::parse_ethernet_ns_packet(&buf[..len]) {
-                    let state_guard = state.lock().await;
+                // PACKET_OUTGOING = 4, PACKET_HOST = 0
+                // We want outgoing packets (type 4) from our interface
+                if packet_type == 4 {  // PACKET_OUTGOING
+                    debug!("Processing outgoing packet");
                     
-                    // 比较源MAC地址与master接口的MAC地址
-                    if source_mac == state_guard.master_mac {
-                        debug!("Outgoing NS packet from our MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} for target {}",
-                               source_mac[0], source_mac[1], source_mac[2], 
-                               source_mac[3], source_mac[4], source_mac[5], target);
+                    // Parse packet containing Ethernet header and NS packet
+                    if let Some((source_mac, target)) = ndp::parse_ethernet_ns_packet(&buf[..len]) {
+                        let state_guard = state.lock().await;
                         
-                        drop(state_guard); // 在异步调用前释放锁
-                        handle_ns_packet(&target, state.clone()).await?;
+                        // Compare source MAC address with master interface MAC address
+                        if source_mac == state_guard.master_mac {
+                            // Validate target address
+                            if target.is_multicast() {
+                                debug!("Ignoring NS packet for multicast target {}", target);
+                            } else if target.is_loopback() {
+                                debug!("Ignoring NS packet for loopback target {}", target);
+                            } else if target.is_unspecified() {
+                                debug!("Ignoring NS packet for unspecified target {}", target);
+                            } else {
+                                debug!("Outgoing NS packet from our MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} for target {}",
+                                       source_mac[0], source_mac[1], source_mac[2], 
+                                       source_mac[3], source_mac[4], source_mac[5], target);
+                                
+                                drop(state_guard); // Release lock before async call
+                                handle_ns_packet(&target, state.clone()).await?;
+                            }
+                        } else {
+                            debug!("Ignoring outgoing NS packet from different MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                   source_mac[0], source_mac[1], source_mac[2], 
+                                   source_mac[3], source_mac[4], source_mac[5]);
+                        }
                     } else {
-                        debug!("Ignoring NS packet from MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                               source_mac[0], source_mac[1], source_mac[2], 
-                               source_mac[3], source_mac[4], source_mac[5]);
+                        debug!("Outgoing packet is not an NS packet");
                     }
+                } else {
+                    debug!("Ignoring packet type {} (not outgoing)", packet_type);
                 }
             },
             Ok(Err(e)) => {
                 error!("Error receiving packet: {}", e);
+                // Exponential backoff to avoid spinning on persistent errors
                 sleep(Duration::from_millis(100)).await;
             },
             Err(_would_block) => {
-                // 套接字暂时不可读，继续等待
+                // Socket is temporarily unreadable, wait for it to become ready again
                 continue;
             }
         }
@@ -220,15 +307,19 @@ async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Resu
 }
 
 async fn handle_ns_packet(target: &Ipv6Addr, state: Arc<Mutex<AppState>>) -> Result<()> {
-    let mut state_guard = state.lock().await;
-    state_guard.ns_counter += 1;
+    // Clone slaves list to avoid holding lock during ping operations
+    let slaves = {
+        let mut state_guard = state.lock().await;
+        state_guard.ns_counter += 1;
+        let ns_count = state_guard.ns_counter;
+        info!("Outgoing NS packet #{} for target {}", ns_count, target);
+        state_guard.slaves.clone()
+    };
 
-    info!("Outgoing NS packet for target {}", target);
-
-    // Send ping6 to each slave interface
+    // Send ping6 to each slave interface without holding the lock
     let mut ping_counter_increment = 0;
 
-    for slave in &state_guard.slaves {
+    for slave in &slaves {
         match ping::send_ping6(slave, target) {
             Ok(_) => {
                 ping_counter_increment += 1;
@@ -240,7 +331,13 @@ async fn handle_ns_packet(target: &Ipv6Addr, state: Arc<Mutex<AppState>>) -> Res
         }
     }
 
-    state_guard.ping_counter += ping_counter_increment;
+    // Update ping counter after all operations
+    {
+        let mut state_guard = state.lock().await;
+        state_guard.ping_counter += ping_counter_increment;
+        let total_pings = state_guard.ping_counter;
+        debug!("Total NS packets processed: {}, total pings sent: {}", state_guard.ns_counter, total_pings);
+    }
 
     Ok(())
 }

@@ -18,8 +18,9 @@ const ND_NEIGHBOR_SOLICIT: u8 = 135;
 
 /// Parse an Ethernet frame containing an ICMPv6 NS packet, extracting source MAC and target IPv6
 pub fn parse_ethernet_ns_packet(packet: &[u8]) -> Option<([u8; 6], Ipv6Addr)> {
-    // Check if packet is large enough for Ethernet + IPv6 + ICMPv6 + NS target
-    if packet.len() < ETH_HEADER_SIZE + IPV6_HEADER_SIZE + ND_NS_TARGET_OFFSET + 16 {
+    // Check if packet is large enough for Ethernet + IPv6 + ICMPv6 NS (14 + 40 + 24 = 78 bytes minimum)
+    // NS packet: ICMPv6 header (4 bytes) + Reserved (4 bytes) + Target Address (16 bytes) = 24 bytes
+    if packet.len() < ETH_HEADER_SIZE + IPV6_HEADER_SIZE + 24 {
         return None;
     }
     
@@ -31,7 +32,7 @@ pub fn parse_ethernet_ns_packet(packet: &[u8]) -> Option<([u8; 6], Ipv6Addr)> {
     // Skip Ethernet header to get IPv6 packet
     let ipv6_packet = &packet[ETH_HEADER_SIZE..];
     
-    // Verify IPv6 version
+    // Verify IPv6 version (first 4 bits should be 6)
     if (ipv6_packet[0] >> 4) != 6 {
         return None;
     }
