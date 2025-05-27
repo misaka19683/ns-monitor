@@ -4,12 +4,14 @@ use std::time::Duration;
 use std::os::fd::AsRawFd;
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio::signal;
+use pnet::datalink::MacAddr;
 
+mod bpf;
 mod ndp;
 mod ping;
 mod interface;
@@ -63,14 +65,13 @@ async fn main() -> Result<()> {
     info!("Starting outbound NS monitor on {} and forwarding to {:?}", args.master, args.slaves);
 
     // Get master interface MAC address for source filtering
-    let master_mac = interface::get_interface_mac(&args.master)?;
-    info!("Master interface MAC address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", 
-          master_mac[0], master_mac[1], master_mac[2], master_mac[3], master_mac[4], master_mac[5]);
+    let master_mac_addr = interface::get_interface_mac(&args.master)?;
+    info!("Master interface MAC address: {}", master_mac_addr);
 
     // Create shared state
     let state = Arc::new(Mutex::new(AppState {
         slaves: args.slaves.clone(),
-        master_mac,
+        master_mac: master_mac_addr,
         ns_counter: 0,
         ping_counter: 0,
     }));
@@ -93,7 +94,7 @@ async fn main() -> Result<()> {
 
 struct AppState {
     slaves: Vec<String>,
-    master_mac: [u8; 6],
+    master_mac: MacAddr,
     ns_counter: u64,
     ping_counter: u64,
 }
@@ -106,28 +107,6 @@ fn validate_interface(interface: &str) -> Result<()> {
     }
 }
 
-/// Generate BPF bytecode array that only allows ICMPv6 packets
-/// Using a simpler filter that just checks for ICMPv6 protocol
-fn create_ns_filter() -> Vec<libc::sock_filter> {
-    vec![
-        // Load packet length
-        libc::sock_filter { code: 0x80, jt: 0, jf: 0, k: 0 },       // BPF_LD + BPF_W + BPF_LEN
-        // Check if packet is large enough (at least 54 bytes for Eth+IPv6+ICMPv6)
-        libc::sock_filter { code: 0x35, jt: 0, jf: 4, k: 54 },      // BPF_JMP + BPF_JGE + BPF_K
-        // Load Ethernet Type field (2 bytes at offset 12)
-        libc::sock_filter { code: 0x28, jt: 0, jf: 0, k: 12 },      // BPF_LD + BPF_H + BPF_ABS
-        // Jump if not IPv6 (0x86dd)
-        libc::sock_filter { code: 0x15, jt: 0, jf: 2, k: 0x86dd },  // BPF_JMP + BPF_JEQ + BPF_K
-        // Load IPv6 Next Header field (1 byte at offset 20)
-        libc::sock_filter { code: 0x30, jt: 0, jf: 0, k: 20 },      // BPF_LD + BPF_B + BPF_ABS
-        // Jump if ICMPv6 (58)
-        libc::sock_filter { code: 0x15, jt: 1, jf: 0, k: 58 },      // BPF_JMP + BPF_JEQ + BPF_K
-        // Reject packet
-        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: 0 },       // BPF_RET + BPF_K
-        // Accept packet
-        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: 0xffff },  // BPF_RET + BPF_K
-    ]
-}
 
 fn setup_ns_monitor_socket(interface: &str) -> Result<Socket> {
     debug!("Creating packet socket for interface: {}", interface);
@@ -179,7 +158,7 @@ fn setup_ns_monitor_socket(interface: &str) -> Result<Socket> {
 
     // Apply BPF filter for NS packets only using manual setsockopt
     debug!("Creating BPF filter for NS packets");
-    let filter = create_ns_filter();
+    let filter = bpf::create_ns_filter();
     debug!("BPF filter created with {} instructions", filter.len());
     
     let filter_prog = libc::sock_fprog {
@@ -257,11 +236,11 @@ async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Resu
                 
                 // PACKET_OUTGOING = 4, PACKET_HOST = 0
                 // We want outgoing packets (type 4) from our interface
-                if packet_type == 4 {  // PACKET_OUTGOING
-                    debug!("Processing outgoing packet");
+                if packet_type == 4 { // PACKET_OUTGOING
+                    debug!("Processing outgoing packet ({} bytes)", len);
                     
-                    // Parse packet containing Ethernet header and NS packet
-                    if let Some((source_mac, target)) = ndp::parse_ethernet_ns_packet(&buf[..len]) {
+                    // Use improved pnet-based NS packet validation
+                    if let Some((source_mac, target)) = ndp::validate_outgoing_ns_packet(&buf[..len]) {
                         let state_guard = state.lock().await;
                         
                         // Compare source MAC address with master interface MAC address
@@ -274,20 +253,19 @@ async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Resu
                             } else if target.is_unspecified() {
                                 debug!("Ignoring NS packet for unspecified target {}", target);
                             } else {
-                                debug!("Outgoing NS packet from our MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} for target {}",
-                                       source_mac[0], source_mac[1], source_mac[2], 
-                                       source_mac[3], source_mac[4], source_mac[5], target);
+                                // This is a valid outgoing NS packet from our interface - promote to INFO level
+                                info!("📡 Detected outgoing NS packet from {} for target {} - forwarding to slave interfaces", 
+                                      source_mac, target);
                                 
                                 drop(state_guard); // Release lock before async call
                                 handle_ns_packet(&target, state.clone()).await?;
                             }
                         } else {
-                            debug!("Ignoring outgoing NS packet from different MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                                   source_mac[0], source_mac[1], source_mac[2], 
-                                   source_mac[3], source_mac[4], source_mac[5]);
+                            debug!("Ignoring outgoing NS packet from different MAC {} (expected {})", 
+                                   source_mac, state_guard.master_mac);
                         }
                     } else {
-                        debug!("Outgoing packet is not an NS packet");
+                        debug!("Outgoing packet is not a valid NS packet");
                     }
                 } else {
                     debug!("Ignoring packet type {} (not outgoing)", packet_type);
@@ -308,27 +286,45 @@ async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Resu
 
 async fn handle_ns_packet(target: &Ipv6Addr, state: Arc<Mutex<AppState>>) -> Result<()> {
     // Clone slaves list to avoid holding lock during ping operations
-    let slaves = {
+    let (slaves, ns_count) = {
         let mut state_guard = state.lock().await;
         state_guard.ns_counter += 1;
         let ns_count = state_guard.ns_counter;
-        info!("Outgoing NS packet #{} for target {}", ns_count, target);
-        state_guard.slaves.clone()
+        let slaves = state_guard.slaves.clone();
+        (slaves, ns_count)
     };
+    
+    info!("🔄 Processing NS packet #{} for target {} - forwarding to {} slave interface(s)", 
+          ns_count, target, slaves.len());
 
     // Send ping6 to each slave interface without holding the lock
     let mut ping_counter_increment = 0;
+    let mut successful_forwards = Vec::new();
+    let mut failed_forwards = Vec::new();
 
     for slave in &slaves {
         match ping::send_ping6(slave, target) {
             Ok(_) => {
                 ping_counter_increment += 1;
-                info!("Sent ping6 to {} on interface {}", target, slave);
+                successful_forwards.push(slave.clone());
+                debug!("✅ Sent ping6 to {} on interface {}", target, slave);
             }
             Err(e) => {
-                error!("Failed to send ping6 on {}: {}", slave, e);
+                failed_forwards.push((slave.clone(), e.to_string()));
+                error!("❌ Failed to send ping6 on {}: {}", slave, e);
             }
         }
+    }
+
+    // Log summary of forwarding results
+    if !successful_forwards.is_empty() {
+        info!("✅ Successfully forwarded ping6 to {} interface(s): {}", 
+              successful_forwards.len(), successful_forwards.join(", "));
+    }
+    if !failed_forwards.is_empty() {
+        warn!("⚠️  Failed to forward ping6 to {} interface(s): {}", 
+              failed_forwards.len(), 
+              failed_forwards.iter().map(|(iface, _)| iface.as_str()).collect::<Vec<_>>().join(", "));
     }
 
     // Update ping counter after all operations
@@ -336,7 +332,8 @@ async fn handle_ns_packet(target: &Ipv6Addr, state: Arc<Mutex<AppState>>) -> Res
         let mut state_guard = state.lock().await;
         state_guard.ping_counter += ping_counter_increment;
         let total_pings = state_guard.ping_counter;
-        debug!("Total NS packets processed: {}, total pings sent: {}", state_guard.ns_counter, total_pings);
+        info!("📊 Statistics - Total NS packets: {}, Total successful pings: {}", 
+              state_guard.ns_counter, total_pings);
     }
 
     Ok(())
