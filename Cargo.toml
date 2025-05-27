@@ -14,7 +14,7 @@ env_logger = "0.11.8"
 libc = "0.2.149"
 log = "0.4.20"
 nix = { version = "0.30.1", features = ["net"] }
-regex = "1.9.5"
 socket2 = { version = "0.5.4", features = ["all"] }
 tokio = { version = "1.32.0", features = ["full"] }
 get_if_addrs = "0.5.3"
+network-interface="2.0.1"

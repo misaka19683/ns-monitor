@@ -152,7 +152,7 @@ fn setup_ns_monitor_socket(interface: &str) -> Result<Socket> {
 }
 
 async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Result<()> {
-    // 使用AsyncFd包装原始套接字，而不是转换为UdpSocket
+    // 使用AsyncFd包装原始套接字
     let async_fd = tokio::io::unix::AsyncFd::new(socket)?;
     
     // 接收缓冲区
