@@ -52,7 +52,10 @@ mod tests {
     #[test]
     fn test_get_interface_mac_not_found() {
         let interfaces = vec![
-            create_mock_interface("eth0", Some(MacAddr::new(0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E))),
+            create_mock_interface(
+                "eth0",
+                Some(MacAddr::new(0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E)),
+            ),
             create_mock_interface("lo", None),
         ];
 
@@ -71,7 +74,10 @@ mod tests {
     #[test]
     fn test_get_interface_mac_no_mac_address() {
         let interfaces = vec![
-            create_mock_interface("eth0", Some(MacAddr::new(0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E))),
+            create_mock_interface(
+                "eth0",
+                Some(MacAddr::new(0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E)),
+            ),
             create_mock_interface("lo", None),
         ];
 
