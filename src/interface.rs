@@ -127,10 +127,4 @@ mod tests {
             interface
         ))
     }
-
-    fn test_interface_functions_exist() {
-        // This test just verifies the functions compile and exist
-        // Actual functionality testing requires real network interfaces
-        assert!(true);
-    }
 }
