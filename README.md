@@ -29,6 +29,9 @@ cd ns-monitor
 # 编译
 cargo build --release
 
+# 或 musl 编译
+cargo build --release --target x86_64-unknown-linux-musl
+
 # 安装 (可选)
 sudo cp target/release/ns-monitor /usr/local/bin/
 ```

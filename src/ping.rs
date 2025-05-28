@@ -18,52 +18,76 @@ struct Icmp6Hdr {
 fn setup_route(addr: &Ipv6Addr, interface: &str, add: bool) -> Result<()> {
     use std::process::Command;
     
+    debug!("setup_route: Starting {} route for IPv6 address {} via interface {}", 
+           if add { "addition" } else { "removal" }, addr, interface);
+    
     let if_index = if_nametoindex(interface)
         .context("Failed to get interface index")?;
     
-    debug!("{} route to {} via interface {} (index: {})", 
+    debug!("setup_route: {} route to {} via interface {} (index: {})", 
            if add { "Adding" } else { "Removing" }, addr, interface, if_index);
     
     let addr_str = addr.to_string();
+    debug!("setup_route: IPv6 address string representation: {}", addr_str);
     
     if add {
+        // Construct command
+        let route_cmd = format!("ip -6 route add {}/128 dev {} metric 128", addr_str, interface);
+        debug!("setup_route: Executing command: {}", route_cmd);
+        
         // Add route: ip -6 route add <addr>/128 dev <interface> metric 128
         let output = Command::new("ip")
             .args(&["-6", "route", "add", &format!("{}/128", addr_str), "dev", interface, "metric", "128"])
             .output()
             .context("Failed to add route")?;
         
+        debug!("setup_route: Command executed, status: {}", output.status);
+        
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            debug!("setup_route: Command stderr: {}", stderr);
+            
             // Route may already exist, which is fine (RTNETLINK answers: File exists)
             if stderr.contains("File exists") || stderr.contains("EEXIST") {
-                debug!("Route to {} via {} already exists", addr, interface);
+                debug!("setup_route: Route to {} via {} already exists", addr, interface);
             } else {
-                debug!("Route add warning: {}", stderr);
+                debug!("setup_route: Route add warning: {}", stderr);
             }
         } else {
-            debug!("Successfully added route to {} via {}", addr, interface);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            debug!("setup_route: Command stdout: {}", stdout);
+            debug!("setup_route: Successfully added route to {} via {}", addr, interface);
         }
     } else {
+        // Construct command
+        let route_cmd = format!("ip -6 route del {}/128 dev {}", addr_str, interface);
+        debug!("setup_route: Executing command: {}", route_cmd);
+        
         // Delete route: ip -6 route del <addr>/128 dev <interface>
         let output = Command::new("ip")
             .args(&["-6", "route", "del", &format!("{}/128", addr_str), "dev", interface])
             .output()
             .context("Failed to remove route")?;
         
+        debug!("setup_route: Command executed, status: {}", output.status);
+        
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            debug!("setup_route: Command stderr: {}", stderr);
+            
             // Route may not exist, which is fine
             if stderr.contains("No such process") || 
                stderr.contains("No such file or directory") ||
                stderr.contains("ESRCH") ||
                stderr.contains("ENOENT") {
-                debug!("Route to {} via {} does not exist", addr, interface);
+                debug!("setup_route: Route to {} via {} does not exist", addr, interface);
             } else {
-                debug!("Route delete warning: {}", stderr);
+                debug!("setup_route: Route delete warning: {}", stderr);
             }
         } else {
-            debug!("Successfully removed route to {} via {}", addr, interface);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            debug!("setup_route: Command stdout: {}", stdout);
+            debug!("setup_route: Successfully removed route to {} via {}", addr, interface);
         }
     }
     
