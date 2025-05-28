@@ -1,94 +1,98 @@
 # NS-Monitor
 
-一个高效的IPv6 Neighbor Solicitation监听和转发工具。
+[English](README.md) | [简体中文](README_ZH.md)
 
-## 功能概述
+A high-efficiency IPv6 Neighbor Solicitation monitoring and forwarding tool.
 
-NS-Monitor是一个轻量级工具，用于：
+## Overview
 
-- 监听指定master网卡发出的IPv6 Neighbor Solicitation数据包
-- 向配置的slave网卡发送ping6请求，帮助Linux内核发现路由
-- 使用高效的原始套接字和BPF过滤器实现
+NS-Monitor is a lightweight tool designed to:
 
-这个工具可以解决多网卡环境下IPv6邻居发现无法跨网卡传播的问题，特别适用于路由器、代理服务器等多网卡设备。
+- Listen for IPv6 Neighbor Solicitation packets sent from a specified master network interface
+- Send ping6 requests via configured slave interfaces to help the Linux kernel discover routes
+- Utilize efficient raw sockets and BPF filters
 
-## 安装
+This tool solves the problem where IPv6 neighbor discovery cannot propagate across interfaces in multi-NIC environments. It is especially suitable for routers, proxy servers, and other multi-interface devices.
 
-### 从源码编译
+## Installation
 
-确保已安装Rust工具链和必要的依赖：
+### Build from Source
+
+Ensure you have the Rust toolchain and necessary dependencies installed:
 
 ```bash
-# 安装Rust (如果尚未安装)
+# Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 克隆仓库
+# Clone the repository
 git clone https://github.com/CalunVier/ns-monitor.git
 cd ns-monitor
 
-# 编译
+# Build
 cargo build --release
 
-# 或 musl 编译
+# Or build with musl
+target
 cargo build --release --target x86_64-unknown-linux-musl
 
-# 安装 (可选)
+# Install (optional)
 sudo cp target/release/ns-monitor /usr/local/bin/
 ```
 
-### 依赖项
+### Dependencies
 
 - Rust 1.56.0+
 - libc6-dev
+- ip command-line tool
 
-在Debian/Ubuntu系统上安装依赖：
+On Debian/Ubuntu systems, install dependencies with:
 
 ```bash
 sudo apt install libc6-dev
 ```
 
-## 使用方法
+## Usage
 
-NS-Monitor需要root权限才能创建原始套接字：
-
-```bash
-sudo ns-monitor -m <master接口> -s <slave接口1>,<slave接口2>,...
-```
-
-### 命令行参数
-
-```
-选项:
-  -m, --master <INTERFACE>     指定要监听NS包的master网卡
-  -s, --slaves <INTERFACES>    指定要发送ping6的slave网卡(以逗号分隔)
-  -l, --log-level <LEVEL>      日志级别 [默认: info] [可选: error, warn, info, debug, trace]
-  -d, --daemon                 以守护进程模式运行
-  -h, --help                   显示帮助信息
-  -V, --version                显示版本信息
-```
-
-### 示例
+NS-Monitor requires root privileges to create raw sockets:
 
 ```bash
-# 监听eth0上发出的NS数据包，向eth1和eth2发送ping6
+sudo ns-monitor -m <master interface> -s <slave1>,<slave2>,...
+```
+
+### Command Line Options
+
+```
+Options:
+  -m, --master <INTERFACE>     Specify the master interface to listen for NS packets
+  -s, --slaves <INTERFACES>    Specify slave interfaces to send ping6 (comma-separated)
+  -l, --log-level <LEVEL>      Log level [default: info] [options: error, warn, info, debug, trace]
+  -d, --daemon                 Run as a daemon
+  -h, --help                   Show help
+  -V, --version                Show version
+```
+
+### Examples
+
+```bash
+# Listen for NS packets on eth0 and send ping6 via eth1 and eth2
 sudo ns-monitor -m eth0 -s eth1,eth2
 
-# 以守护进程模式运行，并设置详细日志
+# Run as a daemon with debug log level
 sudo ns-monitor -m eth0 -s eth1,eth2 -l debug -d
 ```
 
-## 工作原理
+## How It Works
 
-NS-Monitor使用原始套接字捕获IPv6 Neighbor Solicitation数据包，并通过BPF过滤器高效过滤。当检测到本机通过master接口发出NS请求时，程序会向所有配置的slave接口发送ping6请求，以帮助Linux内核在这些接口上发现目标地址的路由。
+NS-Monitor uses raw sockets to capture IPv6 Neighbor Solicitation packets and applies BPF filters for efficiency. When a local NS request is detected on the master interface, the program sends ping6 requests via all configured slave interfaces to help the Linux kernel discover routes to the target address on those interfaces.
 
-## 许可证
+## License
 
 MIT License
 
-## 作者
+## Author
 
 CalunVier (https://github.com/CalunVier)
 
-## 贡献
+## Contributing
 
-欢迎提交问题和Pull Request！
+Issues and Pull Requests are welcome!
