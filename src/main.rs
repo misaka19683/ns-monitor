@@ -216,53 +216,64 @@ async fn monitor_ns_packets(socket: Socket, state: Arc<Mutex<AppState>>) -> Resu
     let mut buf = [MaybeUninit::zeroed(); 1500]; // 标准以太网 MTU
 
     loop {
-        // // 安全地接收数据包
-        // let (len, _addr) = socket.recv_from(&mut buf)?;
-        let Ok(len) = socket.recv(&mut buf) else {
-            continue;
-        };
-        debug!("Received packet of {} bytes", len);
-
-        let buf_slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
-
-        // 解析以太网帧
-        if let Some(ethernet_packet) = EthernetPacket::new(buf_slice) {
-            if ethernet_packet.get_source() != state.lock().await.master_mac {
-                debug!("Ignoring packet from non-master MAC: {}", ethernet_packet.get_source());
-                continue;
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                info!("Received SIGINT, shutting down gracefully");
+                return Ok(());
             }
+            result = async {
+                let Ok(len) = socket.recv(&mut buf) else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                debug!("Received packet of {} bytes", len);
 
-            if ethernet_packet.get_ethertype() != EtherTypes::Ipv6 {
-                debug!("Ignoring non-IPv6 packet");
-                continue;
-            }
+                let buf_slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
 
-            // 解析 IPv6 数据包
-            if let Some(ipv6_packet) = Ipv6Packet::new(ethernet_packet.payload()) {
-                if ipv6_packet.get_next_header() != IpNextHeaderProtocols::Icmpv6 {
-                    debug!("Ignoring non-ICMPv6 packet");
-                    continue;
-                }
+                // 解析以太网帧
+                if let Some(ethernet_packet) = EthernetPacket::new(buf_slice) {
+                    if ethernet_packet.get_source() != state.lock().await.master_mac {
+                        debug!("Ignoring packet from non-master MAC: {}", ethernet_packet.get_source());
+                        return Ok(());
+                    }
 
-                // 解析 ICMPv6 数据包
-                if let Some(icmpv6_packet) = Icmpv6Packet::new(ipv6_packet.payload()) {
-                    if icmpv6_packet.get_icmpv6_type() == Icmpv6Types::NeighborSolicit {
-                        debug!("Detected Neighbor Solicitation packet");
+                    if ethernet_packet.get_ethertype() != EtherTypes::Ipv6 {
+                        debug!("Ignoring non-IPv6 packet");
+                        return Ok(());
+                    }
 
-                        // 提取目标地址
-                        let target = extract_target_address(&icmpv6_packet)?;
-                        handle_ns_packet(&target, state.clone()).await?;
+                    // 解析 IPv6 数据包
+                    if let Some(ipv6_packet) = Ipv6Packet::new(ethernet_packet.payload()) {
+                        if ipv6_packet.get_next_header() != IpNextHeaderProtocols::Icmpv6 {
+                            debug!("Ignoring non-ICMPv6 packet");
+                            return Ok(());
+                        }
+
+                        // 解析 ICMPv6 数据包
+                        if let Some(icmpv6_packet) = Icmpv6Packet::new(ipv6_packet.payload()) {
+                            if icmpv6_packet.get_icmpv6_type() == Icmpv6Types::NeighborSolicit {
+                                debug!("Detected Neighbor Solicitation packet");
+
+                                // 提取目标地址
+                                let target = extract_target_address(&icmpv6_packet)?;
+                                handle_ns_packet(&target, state.clone()).await?;
+                            } else {
+                                debug!("Ignoring non-NS ICMPv6 packet");
+                            }
+                        } else {
+                            debug!("Invalid ICMPv6 packet");
+                        }
                     } else {
-                        debug!("Ignoring non-NS ICMPv6 packet");
+                        debug!("Invalid IPv6 packet");
                     }
                 } else {
-                    debug!("Invalid ICMPv6 packet");
+                    debug!("Invalid Ethernet packet");
                 }
-            } else {
-                debug!("Invalid IPv6 packet");
+                Ok(())
+            } => {
+                if let Err(e) = result {
+                    error!("Error processing packet: {}", e);
+                }
             }
-        } else {
-            debug!("Invalid Ethernet packet");
         }
     }
 }
