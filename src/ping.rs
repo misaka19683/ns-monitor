@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type, SockAddr};
 use log::{info, error, debug};
 use nix::net::if_::if_nametoindex;
+use rtnetlink::{new_connection, RouteMessageBuilder};
 
 /// ICMPv6 Echo Request header
 #[repr(C)]
@@ -13,88 +14,68 @@ struct Icmp6Hdr {
     icmp6_dataun: [u8; 4],
 }
 
-/// Setup or remove a temporary route for the target address
-/// This implementation mimics odhcpd's approach but uses system commands for simplicity
-fn setup_route(addr: &Ipv6Addr, interface: &str, add: bool) -> Result<()> {
-    use std::process::Command;
-    
-    debug!("setup_route: Starting {} route for IPv6 address {} via interface {}", 
-           if add { "addition" } else { "removal" }, addr, interface);
-    
+/// Setup or remove a temporary IPv6 host route using rtnetlink
+/// This mimics odhcpd's approach for ping6 destination routing
+async fn setup_route(addr: &Ipv6Addr, interface: &str, add: bool) -> Result<()> {
+    // Get interface index from name
     let if_index = if_nametoindex(interface)
-        .context("Failed to get interface index")?;
-    
-    debug!("setup_route: {} route to {} via interface {} (index: {})", 
+        .with_context(|| format!("Failed to get index for interface {}", interface))?;
+
+    debug!("setup_route: {} route for IPv6 address {} via interface {} (index {})", 
            if add { "Adding" } else { "Removing" }, addr, interface, if_index);
+
+    // Create netlink connection
+    let (connection, handle, _) = new_connection()
+        .with_context(|| "Failed to create netlink connection")?;
     
-    let addr_str = addr.to_string();
-    debug!("setup_route: IPv6 address string representation: {}", addr_str);
+    // Spawn the connection in a separate task
+    let conn_handle = tokio::spawn(connection);
+
+    // Create IPv6 route message
+    let route = RouteMessageBuilder::<Ipv6Addr>::new()
+        .destination_prefix(*addr, 128)  // /128 host route
+        .output_interface(if_index)
+        .priority(128)  // Use priority 128 like odhcpd (metric)
+        .build();
+
+    let operation = if add { "add" } else { "remove" };
     
-    if add {
-        // Construct command
-        let route_cmd = format!("ip -6 route add {}/128 dev {} metric 128", addr_str, interface);
-        debug!("setup_route: Executing command: {}", route_cmd);
-        
-        // Add route: ip -6 route add <addr>/128 dev <interface> metric 128
-        let output = Command::new("ip")
-            .args(&["-6", "route", "add", &format!("{}/128", addr_str), "dev", interface, "metric", "128"])
-            .output()
-            .context("Failed to add route")?;
-        
-        debug!("setup_route: Command executed, status: {}", output.status);
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!("setup_route: Command stderr: {}", stderr);
-            
-            // Route may already exist, which is fine (RTNETLINK answers: File exists)
-            if stderr.contains("File exists") || stderr.contains("EEXIST") {
-                debug!("setup_route: Route to {} via {} already exists", addr, interface);
-            } else {
-                debug!("setup_route: Route add warning: {}", stderr);
-            }
-        } else {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            debug!("setup_route: Command stdout: {}", stdout);
-            debug!("setup_route: Successfully added route to {} via {}", addr, interface);
-        }
+    let result = if add {
+        debug!("setup_route: Adding IPv6 route for {} via interface {} (index {})", addr, interface, if_index);
+        handle.route().add(route).execute().await
+            .with_context(|| format!("Failed to add route for {} via {}", addr, interface))
     } else {
-        // Construct command
-        let route_cmd = format!("ip -6 route del {}/128 dev {}", addr_str, interface);
-        debug!("setup_route: Executing command: {}", route_cmd);
-        
-        // Delete route: ip -6 route del <addr>/128 dev <interface>
-        let output = Command::new("ip")
-            .args(&["-6", "route", "del", &format!("{}/128", addr_str), "dev", interface])
-            .output()
-            .context("Failed to remove route")?;
-        
-        debug!("setup_route: Command executed, status: {}", output.status);
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!("setup_route: Command stderr: {}", stderr);
-            
-            // Route may not exist, which is fine
-            if stderr.contains("No such process") || 
-               stderr.contains("No such file or directory") ||
-               stderr.contains("ESRCH") ||
-               stderr.contains("ENOENT") {
-                debug!("setup_route: Route to {} via {} does not exist", addr, interface);
+        debug!("setup_route: Removing IPv6 route for {} via interface {} (index {})", addr, interface, if_index);
+        handle.route().del(route).execute().await
+            .with_context(|| format!("Failed to remove route for {} via {}", addr, interface))
+    };
+
+    // Clean up the connection
+    conn_handle.abort();
+
+    match result {
+        Ok(_) => {
+            debug!("setup_route: Successfully {}ed route for {} via {}", operation, addr, interface);
+            Ok(())
+        },
+        Err(e) => {
+            // Handle common cases that are not critical errors
+            let error_msg = format!("{}", e);
+            if add && error_msg.contains("File exists") {
+                debug!("setup_route: Route for {} via {} already exists, continuing", addr, interface);
+                Ok(())
+            } else if !add && (error_msg.contains("No such") || error_msg.contains("not found")) {
+                debug!("setup_route: Route for {} via {} does not exist, continuing", addr, interface);
+                Ok(())
             } else {
-                debug!("setup_route: Route delete warning: {}", stderr);
+                error!("setup_route: Failed to {} route for {} via {}: {}", operation, addr, interface, e);
+                Err(e)
             }
-        } else {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            debug!("setup_route: Command stdout: {}", stdout);
-            debug!("setup_route: Successfully removed route to {} via {}", addr, interface);
         }
     }
-    
-    Ok(())
 }
 
-pub fn send_ping6(interface: &str, target: &Ipv6Addr) -> Result<()> {
+pub async fn send_ping6(interface: &str, target: &Ipv6Addr) -> Result<()> {
     debug!("send_ping6 called with interface: {}, target: {}", interface, target);
     
     // Get interface index
@@ -143,14 +124,14 @@ pub fn send_ping6(interface: &str, target: &Ipv6Addr) -> Result<()> {
     debug!("ICMPv6 Echo Request packet constructed: identifier={}, sequence=1", identifier);
     
     // Setup temporary route (similar to odhcpd's approach)
-    setup_route(target, interface, true)
+    setup_route(target, interface, true).await
         .context("Failed to setup temporary route")?;
     
     // Send the packet
     let result = socket.send_to(packet_bytes, &dest_sockaddr);
     
     // Remove temporary route
-    if let Err(e) = setup_route(target, interface, false) {
+    if let Err(e) = setup_route(target, interface, false).await {
         debug!("Warning: Failed to remove temporary route: {}", e);
     }
     

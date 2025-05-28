@@ -303,7 +303,7 @@ async fn handle_ns_packet(target: &Ipv6Addr, state: Arc<Mutex<AppState>>) -> Res
     let mut failed_forwards = Vec::new();
 
     for slave in &slaves {
-        match ping::send_ping6(slave, target) {
+        match ping::send_ping6(slave, target).await {
             Ok(_) => {
                 ping_counter_increment += 1;
                 successful_forwards.push(slave.clone());
