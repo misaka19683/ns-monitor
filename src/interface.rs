@@ -1,6 +1,5 @@
 use anyhow::Result;
 use pnet::datalink::{self, MacAddr};
-use std::net::Ipv6Addr;
 
 /// Get MAC address of the specified interface
 pub fn get_interface_mac(interface: &str) -> Result<MacAddr> {
@@ -17,27 +16,6 @@ pub fn get_interface_mac(interface: &str) -> Result<MacAddr> {
     );
 }
 
-/// Get IPv6 link-local address of the specified interface
-pub fn get_interface_ipv6_link_local(interface: &str) -> Result<Ipv6Addr> {
-    let interfaces = datalink::interfaces();
-
-    if let Some(iface) = interfaces.into_iter().find(|iface| iface.name == interface) {
-        // Look for IPv6 link-local address (starts with fe80::)
-        for ip in iface.ips {
-            if let std::net::IpAddr::V6(ipv6_addr) = ip.ip() {
-                // Check if this is a link-local address (fe80::/10)
-                let octets = ipv6_addr.octets();
-                if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
-                    return Ok(ipv6_addr);
-                }
-            }
-        }
-    }
-    anyhow::bail!(
-        "Interface {} not found or no IPv6 link-local address available",
-        interface
-    );
-}
 
 #[cfg(test)]
 mod tests {
