@@ -1,125 +1,138 @@
-use std::net::Ipv6Addr;
-use std::os::fd::AsRawFd;
+use std::net::{Ipv6Addr, SocketAddrV6};
 use anyhow::{Context, Result};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, Socket, Type, SockAddr};
 use log::{info, error, debug};
-use pnet::datalink::MacAddr;
-use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
-use pnet::packet::ipv6::MutableIpv6Packet;
-use pnet::packet::icmpv6::{MutableIcmpv6Packet, Icmpv6Types, checksum};
-use pnet::packet::MutablePacket;
-use crate::interface::{get_interface_mac, get_interface_ipv6_link_local};
+use nix::net::if_::if_nametoindex;
+
+/// ICMPv6 Echo Request header
+#[repr(C)]
+struct Icmp6Hdr {
+    icmp6_type: u8,
+    icmp6_code: u8,
+    icmp6_checksum: u16,
+    icmp6_dataun: [u8; 4],
+}
+
+/// Setup or remove a temporary route for the target address
+/// This implementation mimics odhcpd's approach but uses system commands for simplicity
+fn setup_route(addr: &Ipv6Addr, interface: &str, add: bool) -> Result<()> {
+    use std::process::Command;
+    
+    let if_index = if_nametoindex(interface)
+        .context("Failed to get interface index")?;
+    
+    debug!("{} route to {} via interface {} (index: {})", 
+           if add { "Adding" } else { "Removing" }, addr, interface, if_index);
+    
+    let addr_str = addr.to_string();
+    
+    if add {
+        // Add route: ip -6 route add <addr>/128 dev <interface> metric 128
+        let output = Command::new("ip")
+            .args(&["-6", "route", "add", &format!("{}/128", addr_str), "dev", interface, "metric", "128"])
+            .output()
+            .context("Failed to add route")?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Route may already exist, which is fine (RTNETLINK answers: File exists)
+            if stderr.contains("File exists") || stderr.contains("EEXIST") {
+                debug!("Route to {} via {} already exists", addr, interface);
+            } else {
+                debug!("Route add warning: {}", stderr);
+            }
+        } else {
+            debug!("Successfully added route to {} via {}", addr, interface);
+        }
+    } else {
+        // Delete route: ip -6 route del <addr>/128 dev <interface>
+        let output = Command::new("ip")
+            .args(&["-6", "route", "del", &format!("{}/128", addr_str), "dev", interface])
+            .output()
+            .context("Failed to remove route")?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Route may not exist, which is fine
+            if stderr.contains("No such process") || 
+               stderr.contains("No such file or directory") ||
+               stderr.contains("ESRCH") ||
+               stderr.contains("ENOENT") {
+                debug!("Route to {} via {} does not exist", addr, interface);
+            } else {
+                debug!("Route delete warning: {}", stderr);
+            }
+        } else {
+            debug!("Successfully removed route to {} via {}", addr, interface);
+        }
+    }
+    
+    Ok(())
+}
 
 pub fn send_ping6(interface: &str, target: &Ipv6Addr) -> Result<()> {
     debug!("send_ping6 called with interface: {}, target: {}", interface, target);
     
-    // Get source MAC address from interface
-    let src_mac = get_interface_mac(interface)
-        .context("Failed to get interface MAC address")?;
-    debug!("Interface {} MAC address: {}", interface, src_mac);
-    
-    // Create a raw packet socket for sending Ethernet frames
-    let socket = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(libc::ETH_P_ALL)))
-        .context("Failed to create packet socket")?;
-    debug!("Raw packet socket created successfully");
-    
     // Get interface index
-    let if_index = nix::net::if_::if_nametoindex(interface)
+    let if_index = if_nametoindex(interface)
         .context("Failed to get interface index")?;
     debug!("Interface {} has index: {}", interface, if_index);
     
-    // Bind to interface
-    let sll = libc::sockaddr_ll {
-        sll_family: libc::AF_PACKET as u16,
-        sll_protocol: (libc::ETH_P_ALL as u16).to_be(),
-        sll_ifindex: if_index as i32,
-        sll_hatype: 0,
-        sll_pkttype: 0,
-        sll_halen: 0,
-        sll_addr: [0; 8],
-    };
+    // Create a raw ICMPv6 socket
+    let socket = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))
+        .context("Failed to create ICMPv6 socket")?;
+    debug!("Raw ICMPv6 socket created successfully");
     
-    unsafe {
-        let addr_ptr = &sll as *const libc::sockaddr_ll as *const libc::sockaddr;
-        let addr_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
-        if libc::bind(socket.as_raw_fd(), addr_ptr, addr_len) < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
+    // Bind socket to the specific interface
+    socket.bind_device(Some(interface.as_bytes()))
+        .context("Failed to bind socket to interface")?;
     debug!("Socket bound to interface: {}", interface);
     
-    // Use a multicast MAC address as destination since we don't know the target's MAC
-    // This follows ICMPv6 neighbor discovery behavior
-    let dst_mac = MacAddr::new(0x33, 0x33, 
-                              target.octets()[12], 
-                              target.octets()[13],
-                              target.octets()[14], 
-                              target.octets()[15]);
-    debug!("Destination MAC address: {}", dst_mac);
+    // Construct destination address
+    let dest_addr = SocketAddrV6::new(*target, 0, 0, 0);
+    let dest_sockaddr = SockAddr::from(dest_addr);
     
-    // Create buffer for full Ethernet frame
-    // Ethernet (14) + IPv6 (40) + ICMPv6 (8) + payload (24) = 86 bytes
-    let mut buffer = [0u8; 86];
+    // Construct ICMPv6 Echo Request packet
+    let mut icmp_packet = Icmp6Hdr {
+        icmp6_type: 128, // ICMP6_ECHO_REQUEST
+        icmp6_code: 0,
+        icmp6_checksum: 0, // Will be calculated by kernel
+        icmp6_dataun: [0; 4],
+    };
     
-    // Construct Ethernet header
-    {
-        let mut eth_packet = MutableEthernetPacket::new(&mut buffer[..]).unwrap();
-        eth_packet.set_destination(dst_mac);
-        eth_packet.set_source(src_mac);
-        eth_packet.set_ethertype(EtherTypes::Ipv6);
-    }
+    // Set identifier and sequence number in dataun field
+    let identifier = std::process::id() as u16;
+    let sequence = 1u16;
+    icmp_packet.icmp6_dataun[0] = (identifier >> 8) as u8;
+    icmp_packet.icmp6_dataun[1] = (identifier & 0xff) as u8;
+    icmp_packet.icmp6_dataun[2] = (sequence >> 8) as u8;
+    icmp_packet.icmp6_dataun[3] = (sequence & 0xff) as u8;
     
-    let src_addr = get_interface_ipv6_link_local(interface)
-            .context("Failed to get interface IPv6 link-local address")?;
-    debug!("Source IPv6 link-local address: {}", src_addr);
-
-    // Construct IPv6 header
-    {
-        let mut ipv6_packet = MutableIpv6Packet::new(&mut buffer[14..]).unwrap();
-        ipv6_packet.set_version(6);
-        ipv6_packet.set_traffic_class(0);
-        ipv6_packet.set_flow_label(0);
-        ipv6_packet.set_payload_length(32); // ICMPv6 header (8) + payload (24)
-        ipv6_packet.set_next_header(pnet::packet::ip::IpNextHeaderProtocols::Icmpv6);
-        ipv6_packet.set_hop_limit(64);
-        
-        // Get the actual IPv6 link-local address from the interface
-        ipv6_packet.set_source(src_addr);
-        ipv6_packet.set_destination(*target);
-    }
+    // Convert to bytes
+    let packet_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &icmp_packet as *const Icmp6Hdr as *const u8,
+            std::mem::size_of::<Icmp6Hdr>(),
+        )
+    };
     
-    // Construct ICMPv6 Echo Request
-    {
-        let mut icmpv6_packet = MutableIcmpv6Packet::new(&mut buffer[54..]).unwrap();
-        icmpv6_packet.set_icmpv6_type(Icmpv6Types::EchoRequest);
-        icmpv6_packet.set_icmpv6_code(pnet::packet::icmpv6::Icmpv6Code::new(0));
-        
-        // Set identifier and sequence number
-        let identifier = std::process::id() as u16;
-        let sequence = 1u16;
-        let payload = icmpv6_packet.payload_mut();
-        payload[0] = (identifier >> 8) as u8;
-        payload[1] = (identifier & 0xff) as u8;
-        payload[2] = (sequence >> 8) as u8;
-        payload[3] = (sequence & 0xff) as u8;
-        
-        // Add some payload data
-        for i in 4..24 {
-            payload[i] = (i - 4) as u8;
-        }
-        
-        // Calculate checksum using the actual source address
-        
-        let checksum_val = checksum(&icmpv6_packet.to_immutable(), &src_addr, target);
-        icmpv6_packet.set_checksum(checksum_val);
-    }
+    debug!("ICMPv6 Echo Request packet constructed: identifier={}, sequence=1", identifier);
     
-    debug!("ICMPv6 Echo Request packet constructed: identifier={}, sequence=1", std::process::id() as u16);
+    // Setup temporary route (similar to odhcpd's approach)
+    setup_route(target, interface, true)
+        .context("Failed to setup temporary route")?;
     
     // Send the packet
-    match socket.send(&buffer) {
+    let result = socket.send_to(packet_bytes, &dest_sockaddr);
+    
+    // Remove temporary route
+    if let Err(e) = setup_route(target, interface, false) {
+        debug!("Warning: Failed to remove temporary route: {}", e);
+    }
+    
+    match result {
         Ok(sent) => {
-            info!("Sent {} bytes to {} via {} (link-layer)", sent, target, interface);
+            info!("Sent {} bytes ICMPv6 Echo Request to {} via {}", sent, target, interface);
         },
         Err(e) => {
             error!("Failed to send ICMPv6 Echo Request to {} via {}: {}", target, interface, e);
